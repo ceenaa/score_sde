@@ -249,6 +249,123 @@ class NonePredictor(Predictor):
   def update_fn(self, x, t):
     return x, x
 
+# EM or Improved-Euler (Heun's method) with adaptive step-sizes
+@register_predictor(name='adaptive')
+class AdaptivePredictor(Predictor):
+  def __init__(self, sde, score_fn, shape, probability_flow=False, eps=1e-3, abstol = 1e-2, reltol = 1e-2,
+    error_use_prev=True, norm = "L2_scaled", safety = .9, sde_improved_euler=True, extrapolation = True, exp=0.9):
+    super().__init__(sde, score_fn, probability_flow)
+    self.h_min = 1e-10 # min step-size
+    self.t = sde.T # starting t
+    self.eps = eps # end t
+    self.abstol = abstol
+    self.reltol = reltol
+    self.error_use_prev = error_use_prev
+    self.norm = norm
+    self.safety = safety
+    self.sde_improved_euler = sde_improved_euler
+    self.extrapolation = extrapolation
+    self.n = shape[1]*shape[2]*shape[3] #size of each sample
+    self.exp = exp
+    
+    if self.norm == "L2_scaled":
+      def norm_fn(x):
+        return jnp.sqrt(jnp.sum((x)**2, axis=(1,2,3), keepdims=True)/self.n)
+    elif self.norm == "L2":
+      def norm_fn(x):
+        return jnp.sqrt(jnp.sum((x)**2, axis=(1,2,3), keepdims=True))
+    elif self.norm == "Linf":
+      def norm_fn(x):
+        return jnp.max(jnp.abs(x), axis=(1,2,3), keepdims=True)
+    else:
+      raise NotImplementedError(self.norm)
+    self.norm_fn = norm_fn
+
+
+  def update_fn(self, rng, x, t, h, x_prev): 
+    # Note: both h and t are vectors with batch_size elems (this is because we want adaptive step-sizes for each sample separately)
+    my_rsde = self.rsde.sde
+
+    h_ = jnp.expand_dims(h, (1,2,3)) # expand for multiplications
+    t_ = jnp.expand_dims(t, (1,2,3)) # expand for multiplications
+
+    z = random.normal(rng, x.shape)
+    drift, diffusion = my_rsde(x, t)
+
+    if not self.sde_improved_euler: # Like Lamba's algorithm
+      x_mean_new = x - batch_mul(h_, drift)
+      drift_Heun, _ = my_rsde(x_mean_new, t - h) # Heun's method on the ODE
+      if self.extrapolation: # Extrapolate using the Heun's method result
+        x_mean_new = x - batch_mul(h_/2, drift + drift_Heun)
+      x_new = x_mean_new + batch_mul_3(diffusion, jnp.sqrt(h_), z)
+      E = batch_mul(h_/2, drift_Heun - drift) # local-error between EM and Heun (ODEs)
+      x_check = x_mean_new
+    else:
+      # Heun's method for SDE (while Lamba method only focuses on the non-stochastic part, this also includes the stochastic part)
+      K1_mean = -batch_mul(h_, drift)
+      K1 = K1_mean + batch_mul_3(diffusion, jnp.sqrt(h_), z)
+
+      drift_Heun, diffusion_Heun = my_rsde(x + K1, t - h)
+      K2_mean = -batch_mul(h_, drift_Heun)
+      K2 = K2_mean + batch_mul_3(diffusion_Heun, jnp.sqrt(h_), z)
+      E = 1/2*(K2 - K1) # local-error between EM and Heun (SDEs) (right one)
+      #E = 1/2*(K2_mean - K1_mean) # a little bit better with VE, but not that much
+      if self.extrapolation: # Extrapolate using the Heun's method result
+        x_new = x + (1/2)*(K1 + K2)
+        x_check = x + K1
+        x_check_other = x_new
+      else:
+        x_new = x + K1
+        x_check = x + (1/2)*(K1 + K2)
+        x_check_other = x_new
+
+    # Calculating the error-control
+    if self.error_use_prev:
+      reltol_ctl = jnp.maximum(jnp.abs(x_prev), jnp.abs(x_check))*self.reltol
+    else:
+      reltol_ctl = jnp.abs(x_check)*self.reltol
+    err_ctl = jnp.maximum(reltol_ctl, self.abstol)
+
+    # Normalizing for each sample separately
+    E_scaled_norm = self.norm_fn(E/err_ctl)
+
+    # Accept or reject x_{n+1} and t_{n+1} for each sample separately
+    accept = jax.vmap(lambda a: a <= 1)(E_scaled_norm)
+    x = jnp.where(accept, x_new, x)
+    x_prev = jnp.where(accept, x_check, x_prev)
+    t_ = jnp.where(accept, t_ - h_, t_)
+
+    # Change the step-size
+    h_max = jnp.maximum(t_ - self.eps, 0) # max step-size must be the distance to the end (we use maximum between that and zero in case of a tiny but negative value: -1e-10)
+    E_pow = jnp.where(h_ == 0, h_, jnp.power(E_scaled_norm, -self.exp))  # Only applies power when not zero, otherwise, we get nans
+    h_new = jnp.minimum(h_max, self.safety*h_*E_pow)
+
+    return x, x_prev, t_.reshape((-1)), h_new.reshape((-1))
+
+
+@register_predictor(name='ddim')
+class DDIMPredictor(Predictor):
+  """Based on https://arxiv.org/pdf/2010.02502.pdf, version with no noise, only support VP process"""
+
+  def __init__(self, sde, score_fn, shape=None, probability_flow=False, eps=1e-3, abstol = 1e-2, reltol = 1e-2, 
+    error_use_prev=True, norm = "L2_scaled", safety = .9, sde_improved_euler=True, extrapolation = True, exp=0.9):
+    super().__init__(sde, score_fn, probability_flow)
+    if not isinstance(sde, sde_lib.VPSDE):
+      raise NotImplementedError(f"SDE class {sde.__class__.__name__} not yet supported.")
+    assert not probability_flow, "Probability flow not supported by ancestral sampling"
+
+  def vpsde_update_fn(self, rng, x, t, h, x_prev=None):
+    sde = self.sde
+    timestep = (t * (sde.N - 1) / sde.T).astype(jnp.int32)
+    timestep_next = ((t-h) * (sde.N - 1) / sde.T).astype(jnp.int32) # same exact thing as  timestep - 1
+    alpha = sde.alphas_cumprod[timestep]
+    alpha_next = sde.alphas_cumprod[timestep_next]
+    score = -batch_mul(self.score_fn(x, t), jnp.sqrt(1-alpha)) # From Yang score-function to Ho "score-function"
+    x = batch_mul(jnp.sqrt(alpha_next),batch_mul(x - batch_mul(jnp.sqrt(1. - alpha), score), 1. / jnp.sqrt(alpha))) + batch_mul(jnp.sqrt(1-alpha_next), score)
+    return x, x
+
+  def update_fn(self, rng, x, t, h, x_prev=None):
+    return self.vpsde_update_fn(rng, x, t, h, x_prev)
 
 @register_corrector(name='langevin')
 class LangevinCorrector(Corrector):
