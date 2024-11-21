@@ -252,95 +252,170 @@ class NonePredictor(Predictor):
 # EM or Improved-Euler (Heun's method) with adaptive step-sizes
 @register_predictor(name='adaptive')
 class AdaptivePredictor(Predictor):
-  def __init__(self, sde, score_fn, shape, probability_flow=False, eps=1e-3, abstol = 1e-2, reltol = 1e-2,
-    error_use_prev=True, norm = "L2_scaled", safety = .9, sde_improved_euler=True, extrapolation = True, exp=0.9):
-    super().__init__(sde, score_fn, probability_flow)
+  def __init__(self, sde, score_fn, shape, eps=1e-3, 
+    abstol = 1e-2, reltol = 1e-2, safety = .9, exp=0.9):
+    super().__init__(sde, score_fn)
     self.h_min = 1e-10 # min step-size
     self.t = sde.T # starting t
     self.eps = eps # end t
     self.abstol = abstol
     self.reltol = reltol
-    self.error_use_prev = error_use_prev
-    self.norm = norm
+    self.error_use_prev = True
     self.safety = safety
-    self.sde_improved_euler = sde_improved_euler
-    self.extrapolation = extrapolation
     self.n = shape[1]*shape[2]*shape[3] #size of each sample
     self.exp = exp
     
-    if self.norm == "L2_scaled":
-      def norm_fn(x):
-        return jnp.sqrt(jnp.sum((x)**2, axis=(1,2,3), keepdims=True)/self.n)
-    elif self.norm == "L2":
-      def norm_fn(x):
-        return jnp.sqrt(jnp.sum((x)**2, axis=(1,2,3), keepdims=True))
-    elif self.norm == "Linf":
-      def norm_fn(x):
-        return jnp.max(jnp.abs(x), axis=(1,2,3), keepdims=True)
-    else:
-      raise NotImplementedError(self.norm)
+    #"L2_scaled":
+    def norm_fn(x):
+      return torch.sqrt(torch.sum((x)**2, dim=(1,2,3), keepdim=True)/self.n)
     self.norm_fn = norm_fn
 
 
-  def update_fn(self, rng, x, t, h, x_prev): 
+  def update_fn(self, x, t, h, x_prev): 
     # Note: both h and t are vectors with batch_size elems (this is because we want adaptive step-sizes for each sample separately)
     my_rsde = self.rsde.sde
 
-    h_ = jnp.expand_dims(h, (1,2,3)) # expand for multiplications
-    t_ = jnp.expand_dims(t, (1,2,3)) # expand for multiplications
-
-    z = random.normal(rng, x.shape)
+    h_ = h[:, None, None, None] # expand for multiplications
+    t_ = t[:, None, None, None] # expand for multiplications
+    z = torch.randn_like(x)
     drift, diffusion = my_rsde(x, t)
 
-    if not self.sde_improved_euler: # Like Lamba's algorithm
-      x_mean_new = x - batch_mul(h_, drift)
-      drift_Heun, _ = my_rsde(x_mean_new, t - h) # Heun's method on the ODE
-      if self.extrapolation: # Extrapolate using the Heun's method result
-        x_mean_new = x - batch_mul(h_/2, drift + drift_Heun)
-      x_new = x_mean_new + batch_mul_3(diffusion, jnp.sqrt(h_), z)
-      E = batch_mul(h_/2, drift_Heun - drift) # local-error between EM and Heun (ODEs)
-      x_check = x_mean_new
-    else:
-      # Heun's method for SDE (while Lamba method only focuses on the non-stochastic part, this also includes the stochastic part)
-      K1_mean = -batch_mul(h_, drift)
-      K1 = K1_mean + batch_mul_3(diffusion, jnp.sqrt(h_), z)
+    # Heun's method for SDE (while Lamba method only focuses on the non-stochastic part, this also includes the stochastic part)
+    K1_mean = -h_ * drift
+    K1 = K1_mean + diffusion[:, None, None, None] * torch.sqrt(h_) * z
 
-      drift_Heun, diffusion_Heun = my_rsde(x + K1, t - h)
-      K2_mean = -batch_mul(h_, drift_Heun)
-      K2 = K2_mean + batch_mul_3(diffusion_Heun, jnp.sqrt(h_), z)
-      E = 1/2*(K2 - K1) # local-error between EM and Heun (SDEs) (right one)
-      #E = 1/2*(K2_mean - K1_mean) # a little bit better with VE, but not that much
-      if self.extrapolation: # Extrapolate using the Heun's method result
-        x_new = x + (1/2)*(K1 + K2)
-        x_check = x + K1
-        x_check_other = x_new
-      else:
-        x_new = x + K1
-        x_check = x + (1/2)*(K1 + K2)
-        x_check_other = x_new
+    drift_Heun, diffusion_Heun = my_rsde(x + K1, t - h)
+    K2_mean = -h_*drift_Heun
+    K2 = K2_mean + diffusion_Heun[:, None, None, None] * torch.sqrt(h_) * z
+    E = 1/2*(K2 - K1) # local-error between EM and Heun (SDEs) (right one)
+    #E = 1/2*(K2_mean - K1_mean) # a little bit better with VE, but not that much
+    # Extrapolate using the Heun's method result
+    x_new = x + (1/2)*(K1 + K2)
+    x_check = x + K1
+    x_check_other = x_new
 
     # Calculating the error-control
     if self.error_use_prev:
-      reltol_ctl = jnp.maximum(jnp.abs(x_prev), jnp.abs(x_check))*self.reltol
+      reltol_ctl = torch.maximum(torch.abs(x_prev), torch.abs(x_check))*self.reltol
     else:
-      reltol_ctl = jnp.abs(x_check)*self.reltol
-    err_ctl = jnp.maximum(reltol_ctl, self.abstol)
+      reltol_ctl = torch.abs(x_check)*self.reltol
+    err_ctl = torch.clamp(reltol_ctl, min=self.abstol)
 
     # Normalizing for each sample separately
     E_scaled_norm = self.norm_fn(E/err_ctl)
 
     # Accept or reject x_{n+1} and t_{n+1} for each sample separately
-    accept = jax.vmap(lambda a: a <= 1)(E_scaled_norm)
-    x = jnp.where(accept, x_new, x)
-    x_prev = jnp.where(accept, x_check, x_prev)
-    t_ = jnp.where(accept, t_ - h_, t_)
+    accept = E_scaled_norm <= torch.ones_like(E_scaled_norm)
+    x = torch.where(accept, x_new, x)
+    x_prev = torch.where(accept, x_check, x_prev)
+    t_ = torch.where(accept, t_ - h_, t_)
 
     # Change the step-size
-    h_max = jnp.maximum(t_ - self.eps, 0) # max step-size must be the distance to the end (we use maximum between that and zero in case of a tiny but negative value: -1e-10)
-    E_pow = jnp.where(h_ == 0, h_, jnp.power(E_scaled_norm, -self.exp))  # Only applies power when not zero, otherwise, we get nans
-    h_new = jnp.minimum(h_max, self.safety*h_*E_pow)
+    h_max = torch.clamp(t_ - self.eps, min=0) # max step-size must be the distance to the end (we use maximum between that and zero in case of a tiny but negative value: -1e-10)
+    E_pow = torch.where(h_ == 0, h_, torch.pow(E_scaled_norm, -self.exp))  # Only applies power when not zero, otherwise, we get nans
+    h_new = torch.minimum(h_max, self.safety*h_*E_pow)
 
     return x, x_prev, t_.reshape((-1)), h_new.reshape((-1))
+
+def shared_predictor_update_fn(x, t, h, sde, model, predictor, x_prev=None, shape=None,
+    eps=1e-3, abstol = 1e-2, reltol = 1e-2, safety = .9, exp=0.9):
+  """A wrapper that configures and returns the update function of predictors."""
+  predictor_obj = predictor(sde, model, shape=shape, eps=eps, 
+    abstol = abstol, reltol = reltol, safety = safety, exp=0.9)
+  return predictor_obj.update_fn(x, t, h, x_prev)
+
+
+def get_pc_sampler(sde, shape, predictor,
+                   denoise=True, device='cuda',
+                   eps=1e-3, abstol = 1e-2, reltol = 1e-2, safety = .9, exp=0.9, adaptive=False, h_init = 1e-2):
+  """Create a SDE sampler.
+
+  Args:
+    sde: An `sde_lib.SDE` object representing the forward SDE.
+    shape: A sequence of integers. The expected shape of a single sample.
+    predictor: A subclass of `sampling.Predictor` representing the predictor algorithm.
+    denoise: If `True`, add one-step denoising to the final samples.
+    eps: A `float` number. The reverse-time SDE and ODE are integrated to `epsilon` to avoid numerical issues.
+    device: PyTorch device.
+
+  Returns:
+    A sampling function that returns samples and the number of function evaluations during sampling.
+  """
+  predictor_update_fn = functools.partial(shared_predictor_update_fn,
+                                          sde=sde,
+                                          shape=shape,
+                                          predictor=predictor,
+                                          eps=eps, abstol = abstol, reltol = reltol, 
+                                          safety = safety, 
+                                          exp=exp)
+
+  def pc_sampler(model, prior=None):
+    """ The PC sampler funciton.
+
+    Args:
+      model: A score model.
+    Returns:
+      Samples, number of function evaluations.
+    """
+    with torch.no_grad():
+      #print(datetime.now().time())
+      # Initial sample
+      if prior is None:
+        x = sde.prior_sampling(shape).to(device)
+      else:
+        x = prior.to(device)
+      timesteps = np.linspace(sde.T, eps, sde.N)
+      h = timesteps - np.append(timesteps, 0)[1:] # true step-size: difference between current time and next time (only the new predictor classes will use h, others will ignore)
+      N = sde.N - 1
+
+      for i in range(sde.N):
+        t = timesteps[i]
+        vec_t = torch.ones(shape[0]).to(device) * t
+        x, x_mean = predictor_update_fn(x, vec_t, h[i], model=model)
+
+
+      if denoise:
+        eps_t = torch.ones(shape[0]).to(device) * eps
+        u, std = sde.marginal_prob(x, eps_t)
+        x = x + (std[:, None, None, None] ** 2) * model(x, eps_t)
+      #print(datetime.now().time())
+      return x, N + 1
+
+  def pc_sampler_adaptive(model, prior=None):
+    """ The PC sampler funciton.
+
+    Args:
+      model: A score model.
+    Returns:
+      Samples, number of function evaluations.
+    """
+    with torch.no_grad():
+      #print(datetime.now().time())
+      # Initial sample
+      if prior is None:
+        x = sde.prior_sampling(shape).to(device)
+      else:
+        x = prior.to(device)
+      h = torch.ones(shape[0]).to(device) * h_init # initial step_size
+      t = torch.ones(shape[0]).to(device) * sde.T # initial time
+      x_prev = x 
+
+      N = 0
+      while (torch.abs(t - eps) > 1e-6).any():
+        x, x_prev, t, h = predictor_update_fn(x, t, h, x_prev=x_prev, model=model)
+        N = N + 1
+
+      if denoise:
+        eps_t = torch.ones(shape[0]).to(device) * eps
+        u, std = sde.marginal_prob(x, eps_t)
+        x = x + (std[:, None, None, None] ** 2) * model(x, eps_t)
+      #print(datetime.now().time())
+      return x, N + 1
+
+  if adaptive:
+    return pc_sampler_adaptive
+  else:
+    return pc_sampler
 
 
 @register_predictor(name='ddim')
